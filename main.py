@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, UploadFile
 from ingest import parse_email, ingest_doc, parse_pdf, parse_csv
 from query import answer_query, retrieve_risk_chunks
 from compliance import analyse_text
+from summary import generate_summary
 
 app = FastAPI()
 
@@ -41,3 +42,8 @@ async def compliance_scan():
         "flagged_chunks": flagged_chunks,
         "total_flagged":  len(flagged_chunks)
     }
+
+@app.get("/summary")
+async def get_summary():
+    result = generate_summary()
+    return result

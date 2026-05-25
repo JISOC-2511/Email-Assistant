@@ -3,6 +3,7 @@
 import pytest
 from unittest.mock import MagicMock, patch
 from query import retrieve_chunks, build_context, answer_query
+from query import ai_risk_check, retrieve_risk_chunks
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -193,3 +194,175 @@ def test_answer_query_system_message_present(monkeypatch):
     answer_query("question")
     assert captured["messages"][0]["role"] == "system"
     assert len(captured["messages"][0]["content"]) > 0
+
+def make_ai_response(content: str):
+    """Builds a mock OpenAI response with the given content string."""
+    mock = MagicMock()
+    mock.choices[0].message.content = content
+    return mock
+
+def test_ai_risk_check_high_risk(monkeypatch):
+    """Should return risky=True and High Risk for genuinely risky content."""
+    monkeypatch.setattr(
+        "query.client.chat.completions.create",
+        lambda **kwargs: make_ai_response(
+            '{"risky": true, "risk_score": "High Risk", "reason": "Active fraud allegation."}'
+        )
+    )
+    result = ai_risk_check("We have detected fraud in the accounts.")
+    assert result["risky"] is True
+    assert result["risk_score"] == "High Risk"
+    assert "reason" in result
+
+def test_ai_risk_check_low_risk_negation(monkeypatch):
+    """Should return risky=False when negation makes content safe."""
+    monkeypatch.setattr(
+        "query.client.chat.completions.create",
+        lambda **kwargs: make_ai_response(
+            '{"risky": false, "risk_score": "Low Risk", "reason": "Negation present — no actual breach."}'
+        )
+    )
+    result = ai_risk_check("There was no breach of contract.")
+    assert result["risky"] is False
+    assert result["risk_score"] == "Low Risk"
+
+def test_ai_risk_check_medium_risk(monkeypatch):
+    """Should return Medium Risk for speculative mentions."""
+    monkeypatch.setattr(
+        "query.client.chat.completions.create",
+        lambda **kwargs: make_ai_response(
+            '{"risky": true, "risk_score": "Medium Risk", "reason": "Speculative legal mention."}'
+        )
+    )
+    result = ai_risk_check("There could potentially be legal implications.")
+    assert result["risk_score"] == "Medium Risk"
+
+def test_ai_risk_check_bad_json_fallback(monkeypatch):
+    """If GPT returns malformed JSON, should fall back to safe defaults."""
+    monkeypatch.setattr(
+        "query.client.chat.completions.create",
+        lambda **kwargs: make_ai_response("sorry I cannot answer that")
+    )
+    result = ai_risk_check("some text")
+    assert result["risky"] is False
+    assert result["risk_score"] == "Low Risk"
+    assert "reason" in result
+
+def test_ai_risk_check_returns_required_keys(monkeypatch):
+    """Response must always contain risky, risk_score, and reason keys."""
+    monkeypatch.setattr(
+        "query.client.chat.completions.create",
+        lambda **kwargs: make_ai_response(
+            '{"risky": true, "risk_score": "High Risk", "reason": "Fraud detected."}'
+        )
+    )
+    result = ai_risk_check("fraud occurred")
+    assert "risky" in result
+    assert "risk_score" in result
+    assert "reason" in result
+
+
+# ── retrieve_risk_chunks ──────────────────────────────────────────────────────
+
+def make_chunk(content="risky text", filename="emails.eml", score=0.2):
+    return {"content": content, "filename": filename, "score": score}
+
+def test_retrieve_risk_chunks_returns_list(monkeypatch):
+    """Should always return a list."""
+    monkeypatch.setattr("query.retrieve_chunks", lambda q, k: [])
+    result = retrieve_risk_chunks()
+    assert isinstance(result, list)
+
+def test_retrieve_risk_chunks_skips_low_risk(monkeypatch):
+    """Chunks that pass stage 1 as Low Risk should never reach the LLM."""
+    llm_called = {"called": False}
+
+    monkeypatch.setattr("query.retrieve_chunks", lambda q, k: [
+        make_chunk("completely normal business update")
+    ])
+    monkeypatch.setattr("query.analyse_text", lambda t: {
+        "risk_score": "Low Risk", "flagged": False,
+        "risk_keywords": [], "personal_info": {}
+    })
+    def mock_llm(text):
+        llm_called["called"] = True
+        return {"risky": True, "risk_score": "High Risk", "reason": "test"}
+    monkeypatch.setattr("query.ai_risk_check", mock_llm)
+
+    retrieve_risk_chunks()
+    assert llm_called["called"] is False
+
+def test_retrieve_risk_chunks_includes_llm_flagged(monkeypatch):
+    """Chunks that pass stage 1 and are flagged by LLM should be included."""
+    monkeypatch.setattr("query.retrieve_chunks", lambda q, k: [
+        make_chunk("fraud was committed", "report.pdf")
+    ])
+    monkeypatch.setattr("query.analyse_text", lambda t: {
+        "risk_score": "High Risk", "flagged": True,
+        "risk_keywords": ["fraud"], "personal_info": {}
+    })
+    monkeypatch.setattr("query.ai_risk_check", lambda t: {
+        "risky": True, "risk_score": "High Risk", "reason": "Active fraud."
+    })
+
+    result = retrieve_risk_chunks()
+    assert len(result) == 1
+    assert result[0]["filename"] == "report.pdf"
+    assert result[0]["risk_score"] == "High Risk"
+    assert "reason" in result[0]
+
+def test_retrieve_risk_chunks_excludes_llm_cleared(monkeypatch):
+    """Chunks that pass stage 1 but are cleared by LLM should NOT be included."""
+    monkeypatch.setattr("query.retrieve_chunks", lambda q, k: [
+        make_chunk("there was no breach of contract")
+    ])
+    monkeypatch.setattr("query.analyse_text", lambda t: {
+        "risk_score": "Medium Risk", "flagged": True,
+        "risk_keywords": ["breach"], "personal_info": {}
+    })
+    monkeypatch.setattr("query.ai_risk_check", lambda t: {
+        "risky": False, "risk_score": "Low Risk", "reason": "Negation present."
+    })
+
+    result = retrieve_risk_chunks()
+    assert result == []
+
+def test_retrieve_risk_chunks_deduplicates(monkeypatch):
+    """Same chunk content appearing for multiple concepts should only be processed once."""
+    call_count = {"n": 0}
+
+    monkeypatch.setattr("query.retrieve_chunks", lambda q, k: [
+        make_chunk("fraud and breach detected", "a.eml")
+    ])
+    monkeypatch.setattr("query.analyse_text", lambda t: {
+        "risk_score": "High Risk", "flagged": True,
+        "risk_keywords": ["fraud"], "personal_info": {}
+    })
+    def counting_llm(text):
+        call_count["n"] += 1
+        return {"risky": True, "risk_score": "High Risk", "reason": "Fraud."}
+    monkeypatch.setattr("query.ai_risk_check", counting_llm)
+
+    retrieve_risk_chunks()
+    assert call_count["n"] == 1
+
+def test_retrieve_risk_chunks_correct_shape(monkeypatch):
+    """Each returned chunk must have all required keys."""
+    monkeypatch.setattr("query.retrieve_chunks", lambda q, k: [
+        make_chunk("invoice dispute unresolved", "finance.eml")
+    ])
+    monkeypatch.setattr("query.analyse_text", lambda t: {
+        "risk_score": "High Risk", "flagged": True,
+        "risk_keywords": ["invoice dispute"], "personal_info": {}
+    })
+    monkeypatch.setattr("query.ai_risk_check", lambda t: {
+        "risky": True, "risk_score": "High Risk", "reason": "Active dispute."
+    })
+
+    result = retrieve_risk_chunks()
+    assert "content" in result[0]
+    assert "filename" in result[0]
+    assert "risk_score" in result[0]
+    assert "risk_keywords" in result[0]
+    assert "personal_info" in result[0]
+    assert "reason" in result[0]

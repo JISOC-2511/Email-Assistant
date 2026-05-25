@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, UploadFile
 from ingest import parse_email, ingest_doc, parse_pdf, parse_csv
-from query import answer_query
+from query import answer_query, retrieve_risk_chunks
 from compliance import analyse_text
 
 app = FastAPI()
@@ -33,3 +33,11 @@ async def compliance_check(body: dict):
     if not text:
         raise HTTPException(status_code=422, detail="Text field is required")
     return analyse_text(text)
+
+@app.get("/compliance/scan")
+async def compliance_scan():
+    flagged_chunks = retrieve_risk_chunks()
+    return {
+        "flagged_chunks": flagged_chunks,
+        "total_flagged":  len(flagged_chunks)
+    }

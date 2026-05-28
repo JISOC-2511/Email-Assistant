@@ -3,7 +3,7 @@ from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 from io import BytesIO, StringIO
 
-import email, pypdf, csv
+import email, pypdf, csv, extract_msg
 
 def parse_email(fileBytes) -> str:
     msg = email.message_from_bytes(fileBytes)
@@ -48,3 +48,14 @@ def parse_csv(file_bytes: bytes) -> str:
             parts = [f"{k}={v}" for k, v in row.items()]
             lines.append(f"Row {i+1}: {', '.join(parts)}")
     return "\n".join(lines)
+
+# Handles both .msg and .oml files, which are both Outlook email formats
+def parse_msg(file_bytes: bytes) -> str:
+    buffer = BytesIO(file_bytes)
+    content = extract_msg.Message(buffer)
+    subject = content.subject or ""
+    sender = content.sender or ""
+    date = content.date or ""
+    body = content.body or ""
+    content.close()
+    return f"Subject: {subject}\nFrom: {sender}\nDate: {date}\n\n{body}"

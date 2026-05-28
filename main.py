@@ -1,9 +1,18 @@
 from fastapi import FastAPI, HTTPException, UploadFile
-from ingest import parse_email, ingest_doc, parse_pdf, parse_csv
+from fastapi.middleware.cors import CORSMiddleware
+from ingest import parse_email, ingest_doc, parse_pdf, parse_csv, parse_msg
 from query import answer_query, retrieve_risk_chunks
 from compliance import analyse_text
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.post("/upload")
 async def upload_file(file: UploadFile):
@@ -14,6 +23,8 @@ async def upload_file(file: UploadFile):
         text = parse_pdf(content)
     elif file.filename.endswith(".csv"):
         text = parse_csv(content)
+    elif file.filename.endswith(".msg") or file.filename.endswith(".oml"):
+        text = parse_msg(content)
     else:
         raise HTTPException(status_code=400, detail="Unsupported file type")
     ingest_doc(text, metadata={"filename": file.filename})
